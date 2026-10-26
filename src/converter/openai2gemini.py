@@ -1290,15 +1290,16 @@ async def convert_openai_to_gemini_request(openai_request: Dict[str, Any]) -> Di
     # 提取消息列表
     messages = openai_request.get("messages", [])
 
-    # Antigravity does not support assistant prefill turns. The downstream
-    # normalizer would otherwise silently remove the final assistant message.
-    if messages and messages[-1].get("role") == "assistant":
-        raise ValueError("A final assistant message cannot be represented by Antigravity")
-    
-    # Track outstanding calls in transcript order. A tool result may only
-    # answer a preceding call, and every call must be answered before the
-    # conversation continues.
-    pending_tool_calls = {}
+    # 与上游一致，按 ID 查找工具名，不因不完整或重复的历史提前拒绝请求。
+    tool_call_mapping = {}
+    for message in messages:
+        if message.get("role") == "assistant":
+            for tool_call in message.get("tool_calls") or []:
+                encoded_id = tool_call.get("id", "")
+                if encoded_id:
+                    original_id, _ = decode_tool_id_and_signature(encoded_id)
+                    func_name = tool_call.get("function", {}).get("name") or ""
+                    tool_call_mapping[encoded_id] = (func_name, original_id)
     
     # 一次收集工具声明，校验名称并保留参数 schema 供历史调用修正类型。
     tool_schemas = {}
@@ -1334,9 +1335,14 @@ async def convert_openai_to_gemini_request(openai_request: Dict[str, Any]) -> Di
         # 处理工具消息（tool role）- 累积到 pending_tool_parts
         if role == "tool":
             tool_call_id = message.get("tool_call_id", "")
-            if tool_call_id not in pending_tool_calls:
-                raise ValueError(f"Tool message references an unknown preceding tool_call_id: {tool_call_id}")
-            func_name, original_id = pending_tool_calls.pop(tool_call_id)
+            original_id, _ = decode_tool_id_and_signature(tool_call_id)
+            func_name, original_id = tool_call_mapping.get(
+                tool_call_id, (message.get("name"), original_id)
+            )
+            if not func_name:
+                func_name = "unknown_function"
+                log.warning(f"Tool message missing function name for tool_call_id={tool_call_id}, using default: {func_name}")
+            func_name = _normalize_function_name(func_name)
 
             # OpenAI also permits an array of text content parts for tool results.
             if isinstance(content, list):
@@ -1373,8 +1379,6 @@ async def convert_openai_to_gemini_request(openai_request: Dict[str, Any]) -> Di
 
         # 遇到非 tool 消息时，先 flush 累积的 tool parts
         flush_pending_tool_parts()
-        if pending_tool_calls:
-            raise ValueError("Missing tool response for: " + ", ".join(pending_tool_calls))
 
         if role not in ("user", "assistant"):
             raise ValueError(f"Unsupported message role: {role}")
@@ -1394,8 +1398,6 @@ async def convert_openai_to_gemini_request(openai_request: Dict[str, Any]) -> Di
 
             for tool_call in tool_calls:
                 encoded_id = tool_call.get("id", "")
-                if not encoded_id or encoded_id in pending_tool_calls:
-                    raise ValueError(f"Missing or duplicate tool call id: {encoded_id}")
                 try:
                     function = tool_call["function"]
                     args = (
@@ -1403,18 +1405,33 @@ async def convert_openai_to_gemini_request(openai_request: Dict[str, Any]) -> Di
                         if isinstance(function["arguments"], str)
                         else function["arguments"]
                     )
+                    func_name = function["name"]
                 except (json.JSONDecodeError, KeyError) as exc:
-                    raise ValueError("Tool call arguments must be a valid JSON object") from exc
+                    # 上游容错：保留调用，恢复首个 JSON 对象，无法恢复则使用空参数。
+                    function = tool_call.get("function") or {}
+                    func_name = function.get("name")
+                    if not func_name:
+                        log.error(f"Failed to parse tool call (dropped, no name): {exc}")
+                        continue
+                    args = {}
+                    raw_args = function.get("arguments", "")
+                    if isinstance(raw_args, str) and raw_args:
+                        try:
+                            recovered, _ = json.JSONDecoder().raw_decode(raw_args.lstrip())
+                        except ValueError:
+                            recovered = None
+                        if isinstance(recovered, dict):
+                            args = recovered
+                    log.warning(
+                        f"Failed to parse tool call: {exc} - keeping degraded functionCall "
+                        f"name={func_name} args={'partial' if args else 'empty'}"
+                    )
 
-                func_name = function["name"]
-                if not isinstance(args, dict):
-                    raise ValueError(f"Tool call arguments for {func_name} must be a JSON object")
                 if func_name in tool_schemas:
                     args = fix_tool_call_args_types(args, tool_schemas[func_name])
 
                 original_id, _ = decode_tool_id_and_signature(encoded_id)
                 normalized_name = _normalize_function_name(func_name)
-                pending_tool_calls[encoded_id] = (normalized_name, original_id)
                 parts.append({
                     "functionCall": {
                         "id": original_id,
@@ -1424,6 +1441,8 @@ async def convert_openai_to_gemini_request(openai_request: Dict[str, Any]) -> Di
                     # 中转可能改写 tool_call_id，使用跳过校验占位符避免签名损坏。
                     "thoughtSignature": SKIP_THOUGHT_SIGNATURE_VALIDATOR,
                 })
+            if not parts:
+                continue
 
         if not parts:
             raise ValueError(f"{role} message has no content representable by Antigravity")
@@ -1431,8 +1450,6 @@ async def convert_openai_to_gemini_request(openai_request: Dict[str, Any]) -> Di
 
     # 循环结束后，flush 剩余的 tool parts（如果消息列表以 tool 消息结尾）
     flush_pending_tool_parts()
-    if pending_tool_calls:
-        raise ValueError("Missing tool response for: " + ", ".join(pending_tool_calls))
     _sanitize_openai_roundtrip_signatures(contents)
 
     # 强化修复: 合并相邻相同 role 的 contents (Gemini 强制要求交替角色，避免多轮 tool 后紧跟 user 导致 0-token 空回)
