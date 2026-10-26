@@ -1237,16 +1237,10 @@ def _convert_openai_message_content(role: str, content: Any) -> List[Dict[str, A
         if not isinstance(part, dict):
             raise ValueError(f"{role} message contains an invalid content part")
         part_type = part.get("type")
-        if part_type == "text":
-            value = part.get("text")
+        if part_type == "text" or (role == "assistant" and part_type == "refusal"):
+            value = part.get(part_type)
             if not isinstance(value, str):
-                raise ValueError(f"{role} text content part must contain a string")
-            if value:
-                parts.append({"text": value})
-        elif role == "assistant" and part_type == "refusal":
-            value = part.get("refusal")
-            if not isinstance(value, str):
-                raise ValueError("assistant refusal content part must contain a string")
+                raise ValueError(f"{role} {part_type} content part must contain a string")
             if value:
                 parts.append({"text": value})
         elif role == "user" and part_type == "image_url":
@@ -1306,15 +1300,19 @@ async def convert_openai_to_gemini_request(openai_request: Dict[str, Any]) -> Di
     # conversation continues.
     pending_tool_calls = {}
     
-    # 构建工具名称到参数 schema 的映射（用于类型修正）
+    # 一次收集工具声明，校验名称并保留参数 schema 供历史调用修正类型。
     tool_schemas = {}
-    if "tools" in openai_request and openai_request["tools"]:
-        for tool in openai_request["tools"]:
-            if tool.get("type") == "function":
-                function = tool.get("function", {})
-                func_name = function.get("name")
-                if func_name:
-                    tool_schemas[func_name] = function.get("parameters", {})
+    normalized_names = set()
+    for tool in openai_request.get("tools") or []:
+        if tool.get("type") == "function":
+            function = tool["function"]
+            func_name = function["name"]
+            normalized_name = _normalize_function_name(func_name)
+            if normalized_name in normalized_names:
+                raise ValueError("Function tool names collide after Antigravity normalization")
+            normalized_names.add(normalized_name)
+            tool_schemas[func_name] = function.get("parameters", {})
+    tool_names = set(tool_schemas)
 
     # 用于累积连续的 tool message 的 functionResponse parts
     pending_tool_parts = []
@@ -1355,9 +1353,9 @@ async def convert_openai_to_gemini_request(openai_request: Dict[str, Any]) -> Di
 
             # 解析响应数据
             try:
-                response_data = json.loads(content) if isinstance(content, str) else content
-            except (json.JSONDecodeError, TypeError):
-                response_data = {"result": str(content)}
+                response_data = json.loads(content)
+            except json.JSONDecodeError:
+                response_data = {"result": content}
 
             # 确保 response_data 是字典类型（Gemini API 要求 response 必须是对象）
             if not isinstance(response_data, dict):
@@ -1378,10 +1376,6 @@ async def convert_openai_to_gemini_request(openai_request: Dict[str, Any]) -> Di
         if pending_tool_calls:
             raise ValueError("Missing tool response for: " + ", ".join(pending_tool_calls))
 
-        # system/developer 消息已经由 merge_system_messages 处理，这里跳过
-        if role in ("system", "developer"):
-            continue
-
         if role not in ("user", "assistant"):
             raise ValueError(f"Unsupported message role: {role}")
 
@@ -1397,53 +1391,39 @@ async def convert_openai_to_gemini_request(openai_request: Dict[str, Any]) -> Di
         if tool_calls:
             if role != "assistant":
                 raise ValueError("Only assistant messages may contain tool_calls")
-            for tc in tool_calls:
-                encoded_id = tc.get("id", "")
+
+            for tool_call in tool_calls:
+                encoded_id = tool_call.get("id", "")
                 if not encoded_id or encoded_id in pending_tool_calls:
                     raise ValueError(f"Missing or duplicate tool call id: {encoded_id}")
-                original_id, _ = decode_tool_id_and_signature(encoded_id)
-                pending_tool_calls[encoded_id] = (_normalize_function_name(tc["function"]["name"]), original_id)
-
-            # 添加每个工具调用
-            for tool_call in tool_calls:
                 try:
+                    function = tool_call["function"]
                     args = (
-                        json.loads(tool_call["function"]["arguments"])
-                        if isinstance(tool_call["function"]["arguments"], str)
-                        else tool_call["function"]["arguments"]
+                        json.loads(function["arguments"])
+                        if isinstance(function["arguments"], str)
+                        else function["arguments"]
                     )
-                    
-                    # 根据工具的 schema 修正参数类型
-                    func_name = tool_call["function"]["name"]
-                    if not isinstance(args, dict):
-                        raise ValueError(f"Tool call arguments for {func_name} must be a JSON object")
-                    if func_name in tool_schemas:
-                        args = fix_tool_call_args_types(args, tool_schemas[func_name])
-
-                    # 解码工具ID和thoughtSignature
-                    encoded_id = tool_call.get("id", "")
-                    original_id, signature = decode_tool_id_and_signature(encoded_id)
-
-                    # 构建functionCall part
-                    function_call_part = {
-                        "functionCall": {
-                            "id": original_id,
-                            "name": _normalize_function_name(func_name),
-                            "args": args
-                        }
-                    }
-
-                    # OpenAI/RooCode 中转可能会改写或截断 tool_call_id，真实签名回传后容易触发
-                    # Corrupted thought signature。工具调用使用官方跳过校验占位符更稳。
-                    function_call_part["thoughtSignature"] = SKIP_THOUGHT_SIGNATURE_VALIDATOR
-
-                    parts.append(function_call_part)
                 except (json.JSONDecodeError, KeyError) as exc:
                     raise ValueError("Tool call arguments must be a valid JSON object") from exc
 
-            if parts:
-                contents.append({"role": gemini_role, "parts": parts})
-            continue
+                func_name = function["name"]
+                if not isinstance(args, dict):
+                    raise ValueError(f"Tool call arguments for {func_name} must be a JSON object")
+                if func_name in tool_schemas:
+                    args = fix_tool_call_args_types(args, tool_schemas[func_name])
+
+                original_id, _ = decode_tool_id_and_signature(encoded_id)
+                normalized_name = _normalize_function_name(func_name)
+                pending_tool_calls[encoded_id] = (normalized_name, original_id)
+                parts.append({
+                    "functionCall": {
+                        "id": original_id,
+                        "name": normalized_name,
+                        "args": args,
+                    },
+                    # 中转可能改写 tool_call_id，使用跳过校验占位符避免签名损坏。
+                    "thoughtSignature": SKIP_THOUGHT_SIGNATURE_VALIDATOR,
+                })
 
         if not parts:
             raise ValueError(f"{role} message has no content representable by Antigravity")
@@ -1527,16 +1507,6 @@ async def convert_openai_to_gemini_request(openai_request: Dict[str, Any]) -> Di
         gemini_request["systemInstruction"] = openai_request["systemInstruction"]
 
     # 处理工具 - 传递 model 参数以便根据模型类型选择清理策略
-    model = openai_request.get("model", "")
-    declared_tool_names = [
-        tool["function"]["name"]
-        for tool in openai_request.get("tools") or []
-        if tool.get("type") == "function"
-    ]
-    tool_names = set(declared_tool_names)
-    normalized_names = [_normalize_function_name(name) for name in declared_tool_names]
-    if len(set(normalized_names)) != len(normalized_names):
-        raise ValueError("Function tool names collide after Antigravity normalization")
     if "tools" in openai_request and openai_request["tools"]:
         gemini_request["tools"] = convert_openai_tools_to_gemini(openai_request["tools"], model)
 

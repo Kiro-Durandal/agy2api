@@ -63,7 +63,7 @@ class OpenAIChatMessage(BaseModel):
     function_call: Optional[Dict[str, Any]] = None
 
     @model_validator(mode="after")
-    def validate_tool_result(self):
+    def validate_message(self):
         if self.role == "tool" and not self.tool_call_id:
             raise ValueError("tool messages require tool_call_id")
         if self.tool_calls and self.role != "assistant":
@@ -72,17 +72,14 @@ class OpenAIChatMessage(BaseModel):
             raise ValueError("assistant audio history is unsupported by Antigravity")
         if self.function_call is not None:
             raise ValueError("legacy function_call history is unsupported; use tool_calls")
-        if self.role in ("system", "developer"):
-            if isinstance(self.content, str):
-                return self
-            if isinstance(self.content, list) and all(
+        if self.role in ("system", "developer") and not isinstance(self.content, str):
+            if not isinstance(self.content, list) or not all(
                 isinstance(part, dict)
                 and part.get("type") == "text"
                 and isinstance(part.get("text"), str)
                 for part in self.content
             ):
-                return self
-            raise ValueError("system and developer messages require text content")
+                raise ValueError("system and developer messages require text content")
         return self
 
 

@@ -131,21 +131,12 @@ async def merge_system_messages(request_body: Dict[str, Any]) -> Dict[str, Any]:
         else:
             remaining_messages.append(message)
 
-    # 如果没有指令内容，仍须移除空的指令消息，避免传给上游。
-    if not system_parts:
-        if remaining_messages == messages:
-            return request_body
-        result = request_body.copy()
-        result["messages"] = remaining_messages
-        return result
+    if not system_parts and remaining_messages == messages:
+        return request_body
 
-    # 构建新的请求体
+    # 没有文本时也移除空指令消息，避免传给上游。
     result = request_body.copy()
-
-    # 添加或更新 systemInstruction
-    result["systemInstruction"] = {"parts": system_parts}
-
-    # 更新 messages 列表（移除已处理的 system 消息）
+    if system_parts:
+        result["systemInstruction"] = {"parts": system_parts}
     result["messages"] = remaining_messages
-
     return result
