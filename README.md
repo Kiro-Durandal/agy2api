@@ -259,6 +259,16 @@ curl -X POST "http://127.0.0.1:7861/v1/chat/completions" \
   }'
 ```
 
+#### Chat Completions 消息转换范围
+
+- 接受 `system`、`developer`、`user`、`assistant` 和 `tool`。所有位置的 `system` / `developer` 文本都会按顺序收集到 Gemini 的 `systemInstruction`；Gemini 只有一个顶层指令字段，因此无法完整保留这些指令在历史中的位置及各自的角色区别。
+- `user` 支持文本和 Base64 图片 data URL（`data:image/...;base64,...`）。远程图片 URL、音频和文件内容尚未实现转换；这些输入会明确报错，避免被忽略后继续回答。
+- `assistant` 支持文本和函数工具调用；拒绝内容块会转为文本，没有正文时也会保留 `refusal` 字段。assistant 音频历史、旧版 `function` 角色与 `function_call` 尚不支持。
+- 函数工具调用保留原始 `arguments`，由转换器解析字符串或对象参数。畸形 JSON 沿用既有容错：尝试恢复首个 JSON 对象，失败时保留空参数调用。`tool` 结果支持字符串和文本块数组；工具声明、调用、结果及指定工具的 `tool_choice` 使用一致的名称规范化。
+- `tool_choice` 支持 `auto`、`none`、`required` 及指定已声明的函数工具。指定函数时，`function` 应为包含非空 `name` 字符串的对象。规范化后的工具名称冲突、没有声明工具却使用 `required`、指定未声明的工具或命名选择类型错误等情况会返回本地错误。
+
+请求模型的字段或角色校验失败时返回 HTTP 422；内容无法转换、图片 data URL 无效或工具选择无法表达时返回 HTTP 400。后一类错误通常包含 `{"detail":"具体原因"}`。这会将一些原先被忽略或交给远端报错的输入改为本地拒绝；本端点的转换范围未覆盖完整 Chat Completions 功能集合。
+
 ### Gemini 原生格式
 
 ```bash

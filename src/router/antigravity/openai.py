@@ -87,7 +87,10 @@ async def chat_completions(
 
     # 转换为 Gemini 格式 (使用 converter)
     from src.converter.openai2gemini import convert_openai_to_gemini_request
-    gemini_dict = await convert_openai_to_gemini_request(normalized_dict)
+    try:
+        gemini_dict = await convert_openai_to_gemini_request(normalized_dict)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     # convert_openai_to_gemini_request 不包含 model 字段，需要手动添加
     gemini_dict["model"] = real_model
@@ -95,6 +98,14 @@ async def chat_completions(
     # 规范化 Gemini 请求 (使用 antigravity 模式)
     from src.converter.antigravity_fix import normalize_antigravity_request
     gemini_dict = await normalize_antigravity_request(gemini_dict)
+
+    # This endpoint accepts OpenAI roles, but the Antigravity content schema
+    # accepts only USER/MODEL. Catch a conversion regression before HTTP send.
+    for content in gemini_dict.get("contents", []):
+        if not isinstance(content, dict) or content.get("role") not in ("user", "model"):
+            raise HTTPException(
+                status_code=400, detail="Unrepresentable content role for Antigravity"
+            )
 
     # 准备API请求格式 - 提取model并将其他字段放入request中
     api_request = {

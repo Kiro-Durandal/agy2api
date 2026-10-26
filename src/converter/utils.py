@@ -59,9 +59,11 @@ def extract_content_and_reasoning(parts: list) -> tuple:
 
 async def merge_system_messages(request_body: Dict[str, Any]) -> Dict[str, Any]:
     """
-    处理请求体中的 system 消息：
-    - 顶层 system 参数（Anthropic 格式）与开头的连续 system 消息合并为 systemInstruction
-    - 中间的 system 消息转换为 user 消息（保持顺序）
+    将 system/developer 指令收集到 Gemini 的 systemInstruction。
+
+    Gemini contents 不支持这两种角色。即使指令出现在历史对话中间，
+    也不能将其降级为 user 消息；按原有顺序收集指令，并从 contents 中移除。
+    顶层 system 参数用于 Anthropic 格式，排在消息中的指令之前。
 
     Args:
         request_body: OpenAI 或 Claude 格式的请求体，包含 messages 字段
@@ -96,7 +98,8 @@ async def merge_system_messages(request_body: Dict[str, Any]) -> Dict[str, Any]:
     if not messages:
         return request_body
 
-    # 提取开头的连续 system 消息合并为 systemInstruction
+    # 提取所有 system/developer 消息。Gemini 只有一个顶层指令字段，
+    # 因而无法保留这些指令在对话历史中的原始位置。
     system_parts = []
 
     # 如果已经从顶层 system 参数创建了 systemInstruction，获取现有的 parts
@@ -106,17 +109,14 @@ async def merge_system_messages(request_body: Dict[str, Any]) -> Dict[str, Any]:
             system_parts = existing_instruction.get("parts", []).copy()
 
     remaining_messages = []
-    collecting_system = True
-
-    # developer 角色与 system 同语义处理（OpenAI 新版指令角色），上游仅支持 user/model
     instruction_roles = ("system", "developer")
 
     for message in messages:
         role = message.get("role", "")
         content = message.get("content", "")
 
-        if role in instruction_roles and collecting_system:
-            # 提取 system 消息的文本内容
+        if role in instruction_roles:
+            # 提取指令消息的文本内容
             if isinstance(content, str):
                 if content.strip():
                     system_parts.append({"text": content})
@@ -129,33 +129,14 @@ async def merge_system_messages(request_body: Dict[str, Any]) -> Dict[str, Any]:
                     elif isinstance(item, str) and item.strip():
                         system_parts.append({"text": item})
         else:
-            # 遇到非 system 消息，停止收集
-            collecting_system = False
-            if role in instruction_roles:
-                # 将后续的 system 消息转换为 user 消息
-                converted_message = message.copy()
-                converted_message["role"] = "user"
-                remaining_messages.append(converted_message)
-            else:
-                remaining_messages.append(message)
+            remaining_messages.append(message)
 
-    # 如果没有收集到任何 systemInstruction 内容：
-    # 仅当 messages 未发生变化时才返回原始请求体；
-    # 存在被转换为 user 的中间 system 消息时，返回更新后的 messages
-    if not system_parts:
-        if remaining_messages == messages:
-            return request_body
-        result = request_body.copy()
-        result["messages"] = remaining_messages
-        return result
+    if not system_parts and remaining_messages == messages:
+        return request_body
 
-    # 构建新的请求体
+    # 没有文本时也移除空指令消息，避免传给上游。
     result = request_body.copy()
-
-    # 添加或更新 systemInstruction
-    result["systemInstruction"] = {"parts": system_parts}
-
-    # 更新 messages 列表（移除已处理的 system 消息）
+    if system_parts:
+        result["systemInstruction"] = {"parts": system_parts}
     result["messages"] = remaining_messages
-
     return result
