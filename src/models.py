@@ -38,7 +38,7 @@ class OpenAIToolFunction(BaseModel):
 class OpenAIToolCallFunction(BaseModel):
     """An assistant tool call carries arguments, not a tool parameter schema."""
     name: str
-    arguments: Any = ""
+    arguments: str
 
 
 class OpenAIToolCall(BaseModel):
@@ -64,6 +64,8 @@ class OpenAIChatMessage(BaseModel):
 
     @model_validator(mode="after")
     def validate_message(self):
+        if self.role == "tool" and not self.tool_call_id:
+            raise ValueError("tool messages require tool_call_id")
         if self.tool_calls and self.role != "assistant":
             raise ValueError("only assistant messages may contain tool_calls")
         if self.role == "assistant" and self.audio is not None:
