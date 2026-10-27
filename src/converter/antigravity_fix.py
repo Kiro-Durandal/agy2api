@@ -14,6 +14,7 @@ import uuid
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
+from config import get_return_thoughts_to_frontend
 from src.converter.thoughtSignature_fix import SKIP_THOUGHT_SIGNATURE_VALIDATOR
 
 # ==================== 常量配置 ====================
@@ -865,9 +866,7 @@ async def normalize_antigravity_request(
     result = request.copy()
     model = result.get("model", "")
     generation_config = (result.get("generationConfig") or {}).copy()
-
-    # 项目固定为 True（原版从 config 读取 return_thoughts，本项目无此配置项）
-    return_thoughts = True
+    return_thoughts = await get_return_thoughts_to_frontend()
 
     # ========== 0.5 模型名复写（面板可配，热更新） ==========
     # 在抗截断前缀剥离之后、profile 解析之前应用：
