@@ -13,13 +13,9 @@ from typing import Any, Dict, Optional, Tuple
 from log import log
 
 from config import get_credential_select_mode
+from src import session_cache
 from src.google_oauth_api import Credentials
 from src.storage.database import get_database
-
-try:
-    from src import session_cache
-except ImportError:  # 允许独立导入（测试场景）
-    session_cache = None
 
 # sticky 模式的当前粘性凭证（进程内唯一状态；重置函数供测试使用）
 _sticky_email: Optional[str] = None
